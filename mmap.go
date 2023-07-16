@@ -14,7 +14,7 @@ type Decoder interface {
 	Decode([]byte) error
 	Size() int // size of struct
 	Point() Point
-	Less(Point) bool
+	// Less(Point) bool
 	JSON(w io.Writer) error
 }
 
@@ -53,7 +53,7 @@ func (m *Iter) Load(i int) {
 }
 
 func (m *Iter) Less(pt Point) bool {
-	return m.d.Less(pt)
+	return m.d.Point().Less(pt)
 }
 
 func (m *Iter) JSON(w io.Writer) {
