@@ -497,3 +497,39 @@ func loadCSV(filename string, fn func([]string) error) error {
 	}
 	return nil
 }
+
+func TestRightmost(t *testing.T) {
+	list := []int{1, 2, 2, 2, 2, 2, 3, 4, 7, 7, 7, 7, 7, 9, 9, 9, 9, 11, 15, 23, 42, 69}
+	val := 9
+	T := sort.SearchInts(list, val)
+	t.Logf("original value is %d at idx %d", val, T)
+
+	T--
+	prior := list[T]
+	t.Logf("prior value last is %d at %d", prior, T)
+	// T := 7
+	idx := Rightmost(T, func(i int) bool {
+		fnd := list[i]
+		return fnd > T
+	})
+	// t.Logf("for target idx %d (%d) found idx:%d with value %d", T, list[T], idx, list[idx])
+	t.Logf("found idx:%d with value %d", idx, list[idx])
+
+}
+
+func TestPrior(t *testing.T) {
+	list := []int{1, 2, 2, 2, 2, 2, 3, 4, 7, 7, 7, 7, 7, 9, 9, 9, 9, 11, 15, 23, 42, 69}
+	val := 9
+	T := sort.SearchInts(list, val)
+	t.Logf("original value is %d at idx %d", val, T)
+
+	T--
+	prior := list[T]
+	t.Logf("prior value last is %d at %d", prior, T)
+
+	idx := sort.SearchInts(list[:T], prior)
+	// t.Logf("original value is %d at idx %d", val, T)
+
+	t.Logf("found idx:%d with value %d", idx, list[idx])
+
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strconv"
@@ -195,6 +196,10 @@ func (p Point) Less(x Point) bool {
 	}
 }
 
+func (p Point) Equal(x Point) bool {
+	return p.Lat == x.Lat && p.Lon == x.Lon
+}
+
 // Label returns a consistent string representation of the coordinates
 func (p Point) Label() string {
 	return fmt.Sprintf("%010.5f_%010.5f", p.Lat, p.Lon)
@@ -217,6 +222,25 @@ func AreaInRange64(pt Pair, distance float64) Rect {
 	min := Pair{lat - deltaLat, lon - deltaLon}
 	max := Pair{lat + deltaLat, lon + deltaLon}
 	return Rect{min, max}
+}
+
+// Rightmost searches a list for the next smallest value in the list
+// per https://en.wikipedia.org/wiki/Binary_search_algorithm
+func Rightmost(n int, fn func(int) bool) int {
+	L := 0
+	R := n
+	for L < R {
+		// m := floor((L + R) / 2)
+		m := (L + R) / 2
+		fmt.Printf("m:%d L:%d R:%d\n", m, L, R)
+		// if A[m] > T {
+		if fn(m) {
+			R = m
+		} else {
+			L = m + 1
+		}
+	}
+	return R - 1
 }
 
 // Closest searches for a matching point within the distance (in Km)
@@ -307,6 +331,298 @@ func Closest(g GeoPoints, pt Point, deltaKm float64) (int, float64) {
 			closest = dist
 			best = i
 			minLat = pt.Lat - GeoType(closest/DegreeToKilometer)
+			deltaLon = GeoType(closest / lonKmPerDegree)
+			//debugf("(%d) MINLAT: %f", counter, minLat)
+		}
+	}
+	/*
+	   so we're within range... now we keep looking for anything closer past
+	   the initial hit, which will not last long, as we're moving *away* from our destination,
+	   and the only likely improvement is if the longitude was off and we
+	   find a hit that's closer
+
+	   The closest *possible* will be the same lon but directly above our point,
+	   so we calculate what that lat is for the current minimal distance
+	   and once we hit pass that lat we know nothing can be closer and we're
+	   done with that sweep.
+	*/
+	maxLat := pt.Lat + GeoType(closest/DegreeToKilometer)
+	for i := x + 1; i < g.Len(); i++ {
+		counter++
+		this = g.IndexPoint(i)
+		if this.Lat > maxLat {
+			//debugf("%v exceeds max lat of %v", this, maxLat)
+			break
+		}
+		if lonOutside(this.Lon) {
+			//debugf("above lon outside: %v", this)
+			continue
+		}
+		if dist := this.Approximately(pt); dist < closest {
+			best = i
+			closest = dist
+			maxLat = pt.Lat + GeoType(dist/DegreeToKilometer)
+		}
+	}
+	//debugf("Examined %d records", counter)
+
+	return best, closest
+}
+
+func nextClosest(gp GeoPoints, idx int, maxLat float64, pt Point) (int, float64) {
+	dist := math.MaxFloat64
+	same := true
+	best := idx
+	for idx < gp.Len() {
+		this := gp.IndexPoint(idx)
+		if this.Lat > pt.Lat && same {
+			same = false
+			log.Printf("moved past original lat:%f to %f", pt.Lat, this.Lat)
+		}
+		if this.Equal(pt) {
+			log.Printf("hit the jackpot at %d", idx)
+			return idx, 0.0
+		}
+		far := this.Distance(pt)
+		if far < dist {
+			dist = far
+			best = idx
+			log.Printf("[%11d:%8.3f:%v] next closer", best, dist, this)
+			idx++
+			continue
+		}
+		delta := float64(this.Lat - pt.Lat)
+		if delta > maxLat {
+			log.Printf("delta %f exceeds max lat diff %f at pt %v", delta, maxLat, this)
+			return idx, dist
+		}
+		if float64(this.Lat) >= maxLat {
+			return best, dist
+		}
+		// now moving away, so our last hit was best
+		// return idx - 1, dist
+		idx++
+	}
+	log.Println("shouldn't ever hit here, right")
+	return gp.Len(), math.MaxFloat64
+
+}
+
+func priorClosest(g GeoPoints, idx int, firstLat, maxLat float64, pt Point) (int, float64) {
+	// first move to beginning of previous lat series (there may be a bunch)
+	// idx is 1 less than was found originally
+	log.Printf("prior lat to %.12f (for %v)", firstLat, pt)
+	if gl := g.Len(); idx >= gl {
+		log.Printf("oops idx:%d exceeds len:%d", idx, gl)
+		return gl, 999999999999999.9
+	} else {
+		log.Printf("mkay idx:%d versus len:%d", idx, gl)
+	}
+	previous := g.IndexPoint(idx)
+	size := idx + 1
+	x := sort.Search(size, func(i int) bool {
+		h := g.IndexPoint(i)
+		return pt.Less(h)
+	})
+	if x == size {
+		log.Printf("failed to find beginning of previous")
+		return g.Len(), -1
+	}
+	log.Printf("first rec for prior lat %f -- %d (%v)", firstLat, x, g.IndexPoint(x))
+
+	dist := math.MaxFloat64
+	same := true
+	for idx >= 0 {
+		this := g.IndexPoint(idx)
+		log.Printf("scrollback %d -- %v", idx, this)
+		if this.Lat == pt.Lat && this.Lon == pt.Lon {
+			log.Printf("hot damn a back search hits at %d", idx)
+			return idx, 0
+		}
+		if this.Lat != previous.Lat && same {
+			same = false
+			log.Printf("at idx %d we slipped from %f to %f", idx, previous.Lat, this.Lat)
+		}
+		far := this.Distance(pt)
+		if far < dist {
+			dist = far
+			idx--
+			continue
+		}
+		// now moving away, so our last hit was best
+		return idx - 1, dist
+	}
+	log.Println("shouldn't ever hit here, right")
+	return g.Len(), math.MaxFloat64
+
+}
+
+// CloseEnough searches for a matching point within the distance (in Km)
+// of the specified point.
+// It returns the index of the closest point and the distance from the target
+// If nothing is found, it returns the Len() of the points list and -1 distance
+//
+// Possible search scenarios:
+/*
+	1. Exact match on lat/lon
+	2. Exact match on lat, closest lon is in range of that lon
+	3. Exact match on lat, but cloest pt is subsequent lat/lon (i.e., only lon in that lat range are too far)
+	4. Exact match on lat, but closest point on previous lat/lon
+	5. Exact match on lat, but closest point is on *prior to previous* lat
+	6. Lat is past point, but that or subsequent records has closest point
+	7. Lat is past point but prior lat has closest record
+	8. Lat is passt point but record previous to prior lat is closest
+*/
+
+// NOTE: this is an adaptation of Bestest, but distances are approximated to
+//
+//	minimize computational load
+//
+// TODO: the len return is in line w/ Go sort.Search, but perhaps -1 would be better?
+// TODO part too: use distance func to share same routine w/ approx and haversine calcs?
+func CloseEnough(g GeoPoints, pt Point, deltaKm float64) (int, float64) {
+	// Do a binary search to find the "closest" match
+
+	// The point found is not guaranteed to actually be
+	// the shortest distance, as it finds the first point
+	// that is equal to or *greater* than what is searched for
+
+	// It's possible for the first hit to be significantly further away,
+	// whereas an entry before it, while less than the point, is still
+	// closer.
+
+	// The final confounding factor is that the data is order by
+	// latitude *then* longitude, so the following point could be
+	// very close in latitude, the longitude could be much greater.
+	// A subsequent point could be 0.000001 degrees latitude
+	// further (0.11 m), but have the longitude diff be much less
+
+	// To minimize work done (calculating distance),
+	// calculate the furthest away directly by latidude only,
+	// as that is (effectively) invariant
+	maxDeltaLat := pt.Lat - GeoType(deltaKm/DegreeToKilometer)
+
+	x := sort.Search(g.Len(), func(i int) bool {
+		h := g.IndexPoint(i)
+		// return pt.Less(h)
+		return pt.Lat <= h.Lat
+	})
+
+	// did search fail?
+	if x == g.Len() {
+		return x, -1 //math.MaxFloat64//closest
+	}
+
+	this := g.IndexPoint(x)
+	// if we're lucky, maybe we're right on target and our search is complete!
+	if this.Lat == pt.Lat && this.Lon == pt.Lon {
+		log.Println("that's a bingo:", x)
+		return x, 0.0
+	}
+
+	latDelta := this.Lat - pt.Lat
+	dist := pt.Distance(this)
+	log.Printf("[%11d:%8.3f:%v] OUR FIRST HIT: lat delta:%f", x, dist, this, latDelta)
+	for i := 0; i < 8; i++ {
+		y := x - i
+		if y < 0 {
+			break
+		}
+		that := g.IndexPoint(y)
+		if d := pt.Distance(that); d < dist {
+			x = y
+			dist = d
+			log.Printf("[%11d:%8.3f:%v] BEFORE FIRST HIT", x, dist, this)
+			// log.Printf("BEFORE HIT: %d -- %v (%f)", y, that, pt.Distance(that))
+		} else {
+			log.Printf("[%11d:%8.3f:%v] NOPES BEFORE", y, d, that)
+			// log.Printf("NOPES BEFORE: %d -- %v (%f)", y, that, pt.Distance(that))
+			break
+		}
+	}
+	// ok, not a full on match; do we at least have an exact match on latitude?
+	// if this.Lat == pt.Lat {
+	// if latDelta == 0 {
+	latRange := float64(maxDeltaLat)
+	lonIdx, nd := nextClosest(g, x, latRange, pt)
+	// log.Printf("[%11d:%8.3f:%v] OUR FIRST HIT: lat delta:%f", x, dist, this, latDelta)
+	// log.Printf("next closest idx:%d dist:%f pt:%v", lonIdx, dist, g.IndexPoint(lonIdx))
+	// if lonIdx != g.Len() && dist == 0.0 {
+	// 	return lonIdx, dist
+	// }
+	if nd == 0 {
+		return lonIdx, 0
+	}
+	if lonIdx != g.Len() && nd < dist {
+		log.Printf("[%11d:%8.3f:%v] NEXT CLOSEST YES!", lonIdx, nd, this)
+		dist = nd
+		x = lonIdx
+	} else {
+		log.Printf("[%11d:%8.3f:%v] NEXT CLOSEST nah", lonIdx, nd, this)
+	}
+	if x > 0 {
+		pIdx, pDist := priorClosest(g, x-1, float64(this.Lat), latRange, pt)
+		if pIdx >= g.Len() {
+			log.Printf("WHOA prior faile idx: %d/%d", pIdx, g.Len())
+		} else {
+			log.Printf("prev closest idx:%d dist:%f pt:%v", pIdx, pDist, g.IndexPoint(pIdx))
+		}
+		// NOTE: this is a temp hack for initial
+		if pIdx != g.Len() && pDist < dist {
+			dist = pDist
+			x = pIdx
+			// return pIdx, dist
+		}
+	}
+	if true {
+		return x, dist
+	}
+	// }
+	// log.Println("oh fuckitall we are in the mud")
+	// so we either came in exactly on target (not likely),
+	// or somewhat past it.
+	// Start by going backwards as we already know we probably overshot
+	// if we are greater than this then there's no possibility
+	// we will be in range continuing on
+
+	best := x //g.Len()
+
+	//closest := deltaKm + 0.0001 // ensure we have something to best
+	counter := 0
+
+	// our first hit is guaranteed to be equal to or *greater* than our
+	// requested point.
+	//
+	// we have to check both above and below the point in question to see
+	// which has the closed hit
+	dist = this.Approximately(pt)
+	closest := dist
+	debugf("first hit for %v: %v -- %6d/%6d (%f)", pt, this, x, g.Len(), dist)
+
+	lonKmPerDegree := LookupLonKmPerLat(float64(pt.Lat)) //LookupLonKmPerLatInt(int(pt.Lat))
+	deltaLon := GeoType(closest / lonKmPerDegree)
+	lonOutside := func(lon GeoType) bool {
+		maxLon := pt.Lon + deltaLon
+		minLon := pt.Lon - deltaLon
+		return lon < minLon || lon > maxLon
+	}
+
+	// work backwards first, as we likely overshot our target
+	for i := x - 1; i > 0; i-- {
+		counter++
+		this = g.IndexPoint(i)
+		if this.Lat < maxDeltaLat {
+			//debugf("%v exceeded minimum possible lat: %v", this, minLat)
+			break
+		}
+		if lonOutside(this.Lon) {
+			//debugf("below lon outside: %v", this)
+			continue
+		}
+		if dist := pt.Approximately(this); dist < closest {
+			closest = dist
+			best = i
+			maxDeltaLat = pt.Lat - GeoType(closest/DegreeToKilometer)
 			deltaLon = GeoType(closest / lonKmPerDegree)
 			//debugf("(%d) MINLAT: %f", counter, minLat)
 		}
@@ -597,4 +913,22 @@ func DecodePair(buf []byte) Pair {
 	Lat := math.Float64frombits(binary.LittleEndian.Uint64(buf))
 	Lon := math.Float64frombits(binary.LittleEndian.Uint64(buf[8:]))
 	return Pair{Lat, Lon}
+}
+
+func Exists(it *Iter, pt Point) int {
+	for i := 0; i < it.Len(); i++ {
+		this := it.IndexPoint(i)
+		if pt.Equal(this) {
+			return i
+		}
+		if pt.Less(this) {
+			log.Printf("giving up on pt %v at %d (exceeded by %v)", pt, i, this)
+			break
+		}
+	}
+	return it.Len()
+}
+
+func FuckMe() {
+	log.Println("FUCK ME")
 }
